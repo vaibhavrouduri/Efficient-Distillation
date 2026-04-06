@@ -64,7 +64,7 @@ resume:    null                      # Set to a .pth path to resume
 # ----------------------------------------------------------
 wandb:
   enabled:  true
-  project:  "efficient-distillation"
-  entity:   "ag11023-new-york-university"
-  run_name: null          # null → wandb auto-generates a name
-  tags:     ["swin", "knowledge-distillation", "coco"]
+  project:  "efficient-distillation_vr"
+  entity:   "vr2470-new-york-university"
+  run_name: "first_basic_test_no_distillation"       # null → wandb auto-generates a name
+  tags:     ["swin", "basic_test"]
