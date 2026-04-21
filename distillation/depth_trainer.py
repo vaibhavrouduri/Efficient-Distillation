@@ -30,6 +30,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from utils.logger import setup_logger
+from utils.distributed import (
+    is_main_process,
+    reduce_mean,
+    reduce_tensor_sum,
+    unwrap_model,
+    wrap_ddp,
+)
 
 
 class DepthTrainer:
@@ -63,6 +70,11 @@ class DepthTrainer:
         self.device       = device
         self.wandb_run    = wandb_run
         self.logger       = setup_logger("depth_trainer")
+        self.is_main_process = is_main_process()
+        self.distributed = cfg.get("distributed", False)
+
+        if self.distributed:
+            self.model = wrap_ddp(self.model, device)
 
         # Only optimise DPT head parameters
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -100,6 +112,9 @@ class DepthTrainer:
 
     def train(self) -> None:
         for epoch in range(self.start_epoch, self.epochs):
+            if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+                self.train_loader.sampler.set_epoch(epoch)
+
             t0 = time.time()
             train_metrics = self._train_one_epoch(epoch)
             val_metrics   = self._validate(epoch)
@@ -116,7 +131,7 @@ class DepthTrainer:
                 f"time={elapsed:.1f}s"
             )
 
-            if self.wandb_run is not None:
+            if self.wandb_run is not None and self.is_main_process:
                 self.wandb_run.log({
                     "epoch":          epoch + 1,
                     "train/loss":     train_metrics["loss"],
@@ -127,7 +142,8 @@ class DepthTrainer:
                 })
 
             # Save latest checkpoint
-            self._save(epoch, val_metrics["rmse"])
+            if self.is_main_process:
+                self._save(epoch, val_metrics["rmse"])
 
     # ------------------------------------------------------------------
     # Training
@@ -172,7 +188,9 @@ class DepthTrainer:
                     f"  [{epoch+1}][{i+1}/{n_batches}]  loss={loss.item():.4f}"
                 )
 
-        return {"loss": total_loss / n_batches}
+        avg_loss = total_loss / n_batches
+        avg_loss = reduce_mean(avg_loss, self.device)
+        return {"loss": avg_loss}
 
     # ------------------------------------------------------------------
     # Validation
@@ -201,6 +219,15 @@ class DepthTrainer:
             absrel_sum += m["abs_rel"] * b
             delta1_sum += m["delta1"] * b
             n          += b
+
+        totals = torch.tensor(
+            [rmse_sum, absrel_sum, delta1_sum, n],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        totals = reduce_tensor_sum(totals)
+
+        rmse_sum, absrel_sum, delta1_sum, n = totals.tolist()
 
         return {
             "rmse":    rmse_sum   / n,
@@ -253,7 +280,7 @@ class DepthTrainer:
     def _save(self, epoch: int, rmse: float) -> None:
         state = {
             "epoch":      epoch + 1,
-            "model":      self.model.state_dict(),
+            "model":      unwrap_model(self.model).state_dict(),
             "optimiser":  self.optimiser.state_dict(),
             "scheduler":  self.scheduler.state_dict(),
             "best_rmse":  self.best_rmse,
@@ -269,7 +296,7 @@ class DepthTrainer:
 
     def _resume(self, path: str) -> None:
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        self.model.load_state_dict(ckpt["model"])
+        unwrap_model(self.model).load_state_dict(ckpt["model"])
         self.optimiser.load_state_dict(ckpt["optimiser"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.start_epoch = ckpt["epoch"]

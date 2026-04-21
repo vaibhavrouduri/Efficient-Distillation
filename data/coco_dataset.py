@@ -30,6 +30,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import CocoDetection
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
@@ -129,6 +130,9 @@ def build_coco_dataloaders(
     batch_size: int = 32,
     num_workers: int = 8,
     pin_memory: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build COCO train and val DataLoaders.
@@ -159,10 +163,33 @@ def build_coco_dataloaders(
         transforms=build_val_transforms(img_size),
     )
 
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        if distributed
+        else None
+    )
+
+    val_sampler = (
+        DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        if distributed
+        else None
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn,
@@ -172,6 +199,7 @@ def build_coco_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn,

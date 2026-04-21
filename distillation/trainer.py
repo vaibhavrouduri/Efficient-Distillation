@@ -29,6 +29,7 @@ from distillation.losses import DistillationLoss
 from utils.logger import setup_logger
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.metrics import compute_metrics
+from utils.distributed import is_main_process, reduce_mean, wrap_ddp
 
 
 class DistillationTrainer:
@@ -61,6 +62,10 @@ class DistillationTrainer:
         self.teacher      = teacher.to(device)
         self.student      = student.to(device)
         self.adapter      = adapter.to(device)
+
+        if self.distributed:
+            self.student = wrap_ddp(self.student, device)
+            self.adapter = wrap_ddp(self.adapter, device)
         self.loss_fn      = loss_fn
         self.train_loader = train_loader
         self.val_loader   = val_loader
@@ -68,6 +73,8 @@ class DistillationTrainer:
         self.device       = device
         self.logger       = setup_logger("DistillationTrainer")
         self.wandb_run    = wandb_run
+        self.is_main_process = is_main_process()
+        self.distributed = cfg.get("distributed", False)
 
         # Teacher is always in eval mode — we only distil from it
         self.teacher.eval()
@@ -171,6 +178,9 @@ class DistillationTrainer:
         os.makedirs(save_dir, exist_ok=True)
 
         for epoch in range(self.start_epoch, epochs):
+            if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+                self.train_loader.sampler.set_epoch(epoch)
+
             train_losses = self._train_one_epoch(epoch)
             val_metrics  = self._validate(epoch)
 
@@ -188,7 +198,7 @@ class DistillationTrainer:
                 f"(Teacher: {val_metrics.get('val_teacher_top1', 0.0):.4f})"
             )
 
-            if self.wandb_run is not None:
+            if self.wandb_run is not None and self.is_main_process:
                 epoch_log = {
                     "epoch": epoch + 1,
                     "epoch/train_loss_total": train_losses["total"],
@@ -212,16 +222,17 @@ class DistillationTrainer:
             if is_best:
                 self.best_metric = current_metric
 
-            save_checkpoint(
-                path=os.path.join(save_dir, f"epoch_{epoch+1:03d}.pth"),
-                epoch=epoch + 1,
-                student=self.student,
-                adapter=self.adapter,
-                optimiser=self.optimiser,
-                scheduler=self.scheduler,
-                best_metric=self.best_metric,
-                is_best=is_best,
-            )
+            if self.is_main_process:
+                save_checkpoint(
+                    path=os.path.join(save_dir, f"epoch_{epoch+1:03d}.pth"),
+                    epoch=epoch + 1,
+                    student=self.student,
+                    adapter=self.adapter,
+                    optimiser=self.optimiser,
+                    scheduler=self.scheduler,
+                    best_metric=self.best_metric,
+                    is_best=is_best,
+                )
 
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """Single training epoch."""
@@ -290,7 +301,7 @@ class DistillationTrainer:
                     f"loss={loss_dict['total'].item():.4f}  "
                     f"({elapsed:.1f}s elapsed)"
                 )
-                if self.wandb_run is not None:
+                if self.wandb_run is not None and self.is_main_process:
                     global_step = epoch * n_batches + batch_idx
                     self.wandb_run.log(
                         {
@@ -304,7 +315,9 @@ class DistillationTrainer:
                         step=global_step,
                     )
 
-        return {k: v / n_batches for k, v in running.items()}
+        averages = {k: v / n_batches for k, v in running.items()}
+        averages = {k: reduce_mean(v, self.device) for k, v in averages.items()}
+        return averages
 
     def _validate(self, epoch: int) -> Dict[str, float]:
         """Validation pass – returns a dict of metrics."""

@@ -21,6 +21,12 @@ import torch
 
 from utils.logger import setup_logger
 from utils.wandb_logger import init_wandb
+from utils.distributed import (
+    cleanup_distributed,
+    is_main_process,
+    setup_distributed,
+    wrap_ddp,
+)
 
 
 def parse_args():
@@ -83,10 +89,13 @@ def _run_imagenet(cfg: dict, device: torch.device, wandb_run, logger) -> None:
 
     train_loader, val_loader = build_imagenet_dataloaders(
         imagenet_root = cfg["imagenet_root"],
-        img_size      = cfg.get("img_size", 224),
-        batch_size    = cfg.get("batch_size", 32),
-        num_workers   = cfg.get("num_workers", 8),
-        pin_memory    = cfg.get("pin_memory", True),
+        img_size = cfg.get("img_size", 224),
+        batch_size = cfg.get("batch_size", 32),
+        num_workers = cfg.get("num_workers", 8),
+        pin_memory = cfg.get("pin_memory", True),
+        distributed = cfg.get("distributed", False),
+        rank = cfg.get("rank", 0),
+        world_size = cfg.get("world_size", 1),
     )
     logger.info(
         f"ImageNet  train: {len(train_loader.dataset):,}  |  "
@@ -121,7 +130,9 @@ def _run_imagenet(cfg: dict, device: torch.device, wandb_run, logger) -> None:
     )
     logger.info(f"Adapter params: {adapter.num_parameters:,}")
 
-    if cfg.get("compile", True) and hasattr(torch, "compile"):
+    use_compile = cfg.get("compile", True) and not cfg.get("distributed", False)
+
+    if use_compile and hasattr(torch, "compile"):
         try:
             import triton  # noqa: F401
             logger.info("torch.compile: student + adapter ...")
@@ -164,11 +175,14 @@ def _run_depth(cfg: dict, device: torch.device, wandb_run, logger) -> None:
     from data.nyu_depth_dataset import build_nyu_depth_dataloaders
 
     train_loader, val_loader = build_nyu_depth_dataloaders(
-        root        = cfg["nyu_depth_root"],
-        img_size    = cfg.get("img_size", 224),
-        batch_size  = cfg.get("batch_size", 16),
+        root = cfg["nyu_depth_root"],
+        img_size = cfg.get("img_size", 224),
+        batch_size = cfg.get("batch_size", 16),
         num_workers = cfg.get("num_workers", 8),
-        pin_memory  = cfg.get("pin_memory", True),
+        pin_memory = cfg.get("pin_memory", True),
+        distributed = cfg.get("distributed", False),
+        rank = cfg.get("rank", 0),
+        world_size = cfg.get("world_size", 1),
     )
     logger.info(
         f"NYU-Depth  train: {len(train_loader.dataset):,}  |  "
@@ -206,11 +220,14 @@ def _run_lora_depth(cfg: dict, device: torch.device, wandb_run, logger) -> None:
     from data.nyu_depth_dataset import build_nyu_depth_dataloaders
 
     train_loader, val_loader = build_nyu_depth_dataloaders(
-        root        = cfg["nyu_depth_root"],
-        img_size    = cfg.get("img_size", 224),
-        batch_size  = cfg.get("batch_size", 16),
+        root = cfg["nyu_depth_root"],
+        img_size = cfg.get("img_size", 224),
+        batch_size = cfg.get("batch_size", 16),
         num_workers = cfg.get("num_workers", 8),
-        pin_memory  = cfg.get("pin_memory", True),
+        pin_memory = cfg.get("pin_memory", True),
+        distributed = cfg.get("distributed", False),
+        rank = cfg.get("rank", 0),
+        world_size = cfg.get("world_size", 1),
     )
     logger.info(
         f"NYU-Depth  train: {len(train_loader.dataset):,}  |  "
@@ -285,25 +302,43 @@ def main():
         tag = "_".join(o.replace("=", "") for o in args.override)
         cfg.setdefault("wandb", {})["run_name"] = tag
 
-    wandb_run = init_wandb(cfg)
+    dist_ctx = setup_distributed()
+    device = dist_ctx["device"]
 
-    device = _make_device()
-    logger.info(f"Device: {device}")
+    cfg["distributed"] = dist_ctx["distributed"]
+    cfg["rank"] = dist_ctx["rank"]
+    cfg["local_rank"] = dist_ctx["local_rank"]
+    cfg["world_size"] = dist_ctx["world_size"]
+
+    wandb_run = init_wandb(cfg) if is_main_process() else None
+
+    logger.info(
+        f"distributed={cfg['distributed']} "
+        f"rank={cfg['rank']} "
+        f"local_rank={cfg['local_rank']} "
+        f"world_size={cfg['world_size']} "
+        f"device={device}"
+    )
 
     task = cfg.get("task", "imagenet")
     logger.info(f"Task: {task}")
 
-    if task == "imagenet":
-        _run_imagenet(cfg, device, wandb_run, logger)
-    elif task == "depth":
-        _run_depth(cfg, device, wandb_run, logger)
-    elif task == "lora_depth":
-        _run_lora_depth(cfg, device, wandb_run, logger)
-    else:
-        raise ValueError(f"Unknown task: {task!r}. Choose 'imagenet', 'depth', or 'lora_depth'.")
-
-    if wandb_run is not None:
-        wandb_run.finish()
+    try:
+        if task == "imagenet":
+            _run_imagenet(cfg, device, wandb_run, logger)
+        elif task == "depth":
+            _run_depth(cfg, device, wandb_run, logger)
+        elif task == "lora_depth":
+            _run_lora_depth(cfg, device, wandb_run, logger)
+        else:
+            raise ValueError(
+                f"Unknown task: {task!r}. "
+                "Choose 'imagenet', 'depth', or 'lora_depth'."
+            )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import shutil
 from typing import Tuple
 
 import torch
+from utils.distributed import unwrap_model
 
 
 def save_checkpoint(
@@ -25,8 +26,8 @@ def save_checkpoint(
     """
     state = {
         "epoch":        epoch,
-        "student":      student.state_dict(),
-        "adapter":      adapter.state_dict(),
+        "student":      unwrap_model(student).state_dict(),
+        "adapter":      unwrap_model(adapter).state_dict(),
         "optimiser":    optimiser.state_dict(),
         "scheduler":    scheduler.state_dict(),
         "best_metric":  best_metric,
@@ -51,8 +52,8 @@ def load_checkpoint(
         (start_epoch, best_metric)
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    student.load_state_dict(ckpt["student"])
-    adapter.load_state_dict(ckpt["adapter"])
+    unwrap_model(student).load_state_dict(ckpt["student"])
+    unwrap_model(adapter).load_state_dict(ckpt["adapter"])
     if optimiser is not None and "optimiser" in ckpt:
         optimiser.load_state_dict(ckpt["optimiser"])
     if scheduler is not None and "scheduler" in ckpt:
